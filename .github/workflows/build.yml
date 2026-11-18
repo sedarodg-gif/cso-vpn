@@ -32,10 +32,12 @@ jobs:
       - name: Installer les paquets
         run: flutter pub get
 
-      - name: Construire l'APK
-        run: flutter build apk --release
+      - name: Construire les APK (un par architecture, plus légers)
+        run: flutter build apk --release --split-per-abi
 
       - uses: actions/upload-artifact@v4
         with:
           name: CSO-VPN-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: |
+            build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk

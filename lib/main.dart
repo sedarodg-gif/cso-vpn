@@ -39,6 +39,11 @@ class Account {
     this.method = 'aes-256-gcm',
     this.server = '',
     this.port = '',
+    this.net = 'tcp',
+    this.tls = false,
+    this.sni = '',
+    this.host = '',
+    this.path = '',
     this.raw,
   });
 
@@ -47,7 +52,12 @@ class Account {
   String method; // Shadowsocks seulement
   String server;
   String port;
-  String? raw; // lien complet importé (garde tls, ws, etc.)
+  String net; // tcp, ws, grpc
+  bool tls;
+  String sni;
+  String host;
+  String path; // chemin WebSocket ou nom du service gRPC
+  String? raw; // lien complet importé (garde toutes les options)
 
   String get name => '${proto}_$server';
 
@@ -57,6 +67,11 @@ class Account {
         'method': method,
         'server': server,
         'port': port,
+        'net': net,
+        'tls': tls,
+        'sni': sni,
+        'host': host,
+        'path': path,
         'raw': raw,
       };
 
@@ -66,22 +81,67 @@ class Account {
         method: '${j['method'] ?? 'aes-256-gcm'}',
         server: '${j['server'] ?? ''}',
         port: '${j['port'] ?? ''}',
+        net: '${j['net'] ?? 'tcp'}',
+        tls: j['tls'] == true,
+        sni: '${j['sni'] ?? ''}',
+        host: '${j['host'] ?? ''}',
+        path: '${j['path'] ?? ''}',
         raw: j['raw'] as String?,
       );
 }
 
-/// Construit un lien simple à partir des champs (sans options avancées).
-String? buildLink(Account a) {
-  if (a.id.isEmpty || a.server.isEmpty || int.tryParse(a.port) == null) {
-    return null;
+final RegExp _uuidRe = RegExp(
+  r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+);
+
+/// Vérifie les champs saisis à la main. Renvoie un message d'erreur ou null.
+String? validate(Account a) {
+  final isUuid = a.proto == 'vmess' || a.proto == 'vless';
+  if (a.server.isEmpty) return 'Indique le serveur.';
+  final p = int.tryParse(a.port);
+  if (p == null || p < 1 || p > 65535) {
+    return 'Le port doit être un nombre entre 1 et 65535.';
   }
+  if (a.id.isEmpty) {
+    return isUuid ? "Indique l'UUID." : 'Indique le mot de passe.';
+  }
+  if (isUuid && !_uuidRe.hasMatch(a.id)) {
+    return "L'UUID n'est pas valide. Il ressemble à "
+        '123e4567-e89b-12d3-a456-426614174000. '
+        "Si tu as un lien complet, utilise IMPORTER.";
+  }
+  return null;
+}
+
+Map<String, String> _streamParams(Account a) {
+  final sni = a.sni.isNotEmpty ? a.sni : (a.host.isNotEmpty ? a.host : a.server);
+  final m = <String, String>{'type': a.net, 'security': a.tls ? 'tls' : 'none'};
+  if (a.tls) m['sni'] = sni;
+  if (a.net == 'ws') {
+    if (a.host.isNotEmpty) m['host'] = a.host;
+    if (a.path.isNotEmpty) m['path'] = a.path;
+  }
+  if (a.net == 'grpc' && a.path.isNotEmpty) m['serviceName'] = a.path;
+  return m;
+}
+
+String _query(Map<String, String> m) =>
+    m.entries.map((e) => '${e.key}=${Uri.encodeQueryComponent(e.value)}').join('&');
+
+/// Construit un lien à partir des champs (avec TLS / WebSocket / gRPC).
+String buildLink(Account a) {
   final tag = Uri.encodeComponent('CSO-${a.server}');
   switch (a.proto) {
     case 'vless':
       return 'vless://${Uri.encodeComponent(a.id)}@${a.server}:${a.port}'
-          '?encryption=none&type=tcp#$tag';
+          '?encryption=none&${_query(_streamParams(a))}#$tag';
+    case 'trojan':
+      return 'trojan://${Uri.encodeComponent(a.id)}@${a.server}:${a.port}'
+          '?${_query(_streamParams(a))}#$tag';
     case 'vmess':
       {
+        final sni =
+            a.sni.isNotEmpty ? a.sni : (a.host.isNotEmpty ? a.host : a.server);
         final j = {
           'v': '2',
           'ps': 'CSO-${a.server}',
@@ -90,18 +150,16 @@ String? buildLink(Account a) {
           'id': a.id,
           'aid': '0',
           'scy': 'auto',
-          'net': 'tcp',
+          'net': a.net,
           'type': 'none',
-          'host': '',
-          'path': '',
-          'tls': '',
+          'host': a.host,
+          'path': a.path,
+          'tls': a.tls ? 'tls' : '',
+          'sni': a.tls ? sni : '',
         };
         return 'vmess://${base64.encode(utf8.encode(jsonEncode(j)))}';
       }
-    case 'trojan':
-      return 'trojan://${Uri.encodeComponent(a.id)}@${a.server}:${a.port}'
-          '?security=tls&type=tcp#$tag';
-    case 'ss':
+    default:
       {
         final ui = base64Url
             .encode(utf8.encode('${a.method}:${a.id}'))
@@ -109,13 +167,14 @@ String? buildLink(Account a) {
         return 'ss://$ui@${a.server}:${a.port}#$tag';
       }
   }
-  return null;
 }
 
 String _b64decode(String s) {
   final fixed = s.replaceAll('-', '+').replaceAll('_', '/');
   return utf8.decode(base64.decode(base64.normalize(fixed)));
 }
+
+String _normNet(String? n) => (n == 'ws' || n == 'grpc') ? n! : 'tcp';
 
 Account? _parseSs(String link) {
   final body = link.substring(5).split('#').first.split('?').first;
@@ -168,18 +227,29 @@ Account? parseLink(String input) {
             id: '${j['id'] ?? ''}',
             server: '${j['add'] ?? ''}',
             port: '${j['port'] ?? ''}',
+            net: _normNet('${j['net'] ?? 'tcp'}'),
+            tls: '${j['tls'] ?? ''}' == 'tls',
+            sni: '${j['sni'] ?? ''}',
+            host: '${j['host'] ?? ''}',
+            path: '${j['path'] ?? ''}',
             raw: link,
           );
         }
       case 'vless':
       case 'trojan':
         {
-          final u = Uri.parse(link);
+          final u = Uri.parse(link.split('#').first);
+          final q = u.queryParameters;
           return Account(
             proto: scheme,
             id: Uri.decodeComponent(u.userInfo),
             server: u.host,
             port: u.hasPort ? '${u.port}' : '',
+            net: _normNet(q['type']),
+            tls: q['security'] == 'tls',
+            sni: q['sni'] ?? q['peer'] ?? '',
+            host: q['host'] ?? '',
+            path: q['path'] ?? q['serviceName'] ?? '',
             raw: link,
           );
         }
@@ -228,8 +298,13 @@ class _HomePageState extends State<HomePage> {
   final _method = TextEditingController(text: 'aes-256-gcm');
   final _server = TextEditingController();
   final _port = TextEditingController();
+  final _sni = TextEditingController();
+  final _host = TextEditingController();
+  final _path = TextEditingController();
 
   String _proto = 'vless';
+  String _netType = 'tcp';
+  bool _tls = false;
   String? _raw;
 
   String _state = 'DISCONNECTED';
@@ -252,6 +327,9 @@ class _HomePageState extends State<HomePage> {
     _method.dispose();
     _server.dispose();
     _port.dispose();
+    _sni.dispose();
+    _host.dispose();
+    _path.dispose();
     super.dispose();
   }
 
@@ -272,12 +350,57 @@ class _HomePageState extends State<HomePage> {
       ..showSnackBar(SnackBar(content: Text(text)));
   }
 
+  /// Affiche une erreur claire, avec un bouton DÉTAILS pour voir la cause réelle.
+  Future<void> _fail(String friendly, Object e) async {
+    var details = '$e';
+    try {
+      details = '$details\n\n${await _vless.getProviderDebugSnapshot()}';
+    } catch (_) {}
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          duration: const Duration(seconds: 12),
+          content: Text(friendly),
+          action: SnackBarAction(
+            label: 'DÉTAILS',
+            onPressed: () {
+              showDialog<void>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Détails'),
+                  content: SingleChildScrollView(child: SelectableText(details)),
+                  actions: [
+                    TextButton(
+                      onPressed: () =>
+                          Clipboard.setData(ClipboardData(text: details)),
+                      child: const Text('COPIER'),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('FERMER'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      );
+  }
+
   Account _current() => Account(
         proto: _proto,
         id: _id.text.trim(),
         method: _method.text.trim().isEmpty ? 'aes-256-gcm' : _method.text.trim(),
         server: _server.text.trim(),
         port: _port.text.trim(),
+        net: _netType,
+        tls: _tls,
+        sni: _sni.text.trim(),
+        host: _host.text.trim(),
+        path: _path.text.trim(),
         raw: _raw,
       );
 
@@ -288,6 +411,11 @@ class _HomePageState extends State<HomePage> {
       _method.text = a.method;
       _server.text = a.server;
       _port.text = a.port;
+      _netType = a.net;
+      _tls = a.tls;
+      _sni.text = a.sni;
+      _host.text = a.host;
+      _path.text = a.path;
       _raw = a.raw;
     });
   }
@@ -297,16 +425,19 @@ class _HomePageState extends State<HomePage> {
       try {
         await _vless.stopVless();
       } catch (e) {
-        _msg('Erreur : $e');
+        await _fail('Impossible de déconnecter.', e);
       }
       return;
     }
     final acc = _current();
-    final link = acc.raw ?? buildLink(acc);
-    if (link == null) {
-      _msg('Remplis tous les champs ou importe un lien.');
-      return;
+    if (acc.raw == null) {
+      final err = validate(acc);
+      if (err != null) {
+        _msg(err);
+        return;
+      }
     }
+    final link = acc.raw ?? buildLink(acc);
     try {
       final parsed = FlutterVless.parse(link);
       await _vless.initializeVless(
@@ -322,7 +453,16 @@ class _HomePageState extends State<HomePage> {
         _msg('Permission VPN refusée.');
       }
     } catch (e) {
-      _msg('Erreur : $e');
+      final text = '$e';
+      if (text.contains('INVALID_CONFIG')) {
+        await _fail(
+          'Configuration refusée. Vérifie UUID / mot de passe, serveur, port, '
+          'TLS et WebSocket, ou importe le lien complet.',
+          e,
+        );
+      } else {
+        await _fail('Connexion impossible.', e);
+      }
     }
   }
 
@@ -352,12 +492,11 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _share() async {
     final acc = _current();
-    final link = acc.raw ?? buildLink(acc);
-    if (link == null) {
+    if (acc.raw == null && validate(acc) != null) {
       _msg('Rien à partager : remplis les champs.');
       return;
     }
-    await Clipboard.setData(ClipboardData(text: link));
+    await Clipboard.setData(ClipboardData(text: acc.raw ?? buildLink(acc)));
     _msg('Lien copié, tu peux le coller où tu veux.');
   }
 
@@ -411,6 +550,7 @@ class _HomePageState extends State<HomePage> {
   Widget _btn(String label, VoidCallback? onTap, {double fs = 18}) {
     return SizedBox(
       height: 52,
+      width: double.infinity,
       child: FilledButton(
         onPressed: onTap,
         style: FilledButton.styleFrom(
@@ -418,13 +558,54 @@ class _HomePageState extends State<HomePage> {
           foregroundColor: Colors.white,
           shape: const StadiumBorder(),
           elevation: 3,
-          padding: const EdgeInsets.symmetric(horizontal: 22),
+          padding: const EdgeInsets.symmetric(horizontal: 16),
         ),
-        child: Text(
-          label,
-          style: TextStyle(fontSize: fs, fontWeight: FontWeight.w800),
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Text(
+            label,
+            maxLines: 1,
+            style: TextStyle(fontSize: fs, fontWeight: FontWeight.w800),
+          ),
         ),
       ),
+    );
+  }
+
+  Widget _seg(String label, VoidCallback onTap) {
+    return Expanded(
+      child: TextButton(
+        onPressed: onTap,
+        style: TextButton.styleFrom(
+          foregroundColor: Colors.white,
+          minimumSize: const Size.fromHeight(52),
+        ),
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Text(
+            label,
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w800),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _chip(String label, bool selected, VoidCallback onTap) {
+    return ChoiceChip(
+      label: Text(label),
+      selected: selected,
+      showCheckmark: false,
+      selectedColor: kSlate,
+      backgroundColor: Colors.transparent,
+      shape: const StadiumBorder(),
+      side: const BorderSide(color: kSlate, width: 2),
+      labelStyle: TextStyle(
+        fontWeight: FontWeight.w800,
+        fontSize: 15,
+        color: selected ? Colors.white : kSlate,
+      ),
+      onSelected: (_) => onTap(),
     );
   }
 
@@ -457,6 +638,63 @@ class _HomePageState extends State<HomePage> {
           ],
         ),
       ],
+    );
+  }
+
+  Widget _advanced() {
+    return Theme(
+      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+      child: ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        childrenPadding: EdgeInsets.zero,
+        title: const Text(
+          'Options avancées (TLS, WebSocket, SNI…)',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.w800,
+            color: kSlate,
+          ),
+        ),
+        children: [
+          Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 8,
+            children: [
+              for (final n in const [
+                ['tcp', 'TCP'],
+                ['ws', 'WebSocket'],
+                ['grpc', 'gRPC'],
+              ])
+                _chip(n[1], _netType == n[0], () {
+                  setState(() {
+                    _netType = n[0];
+                    _raw = null;
+                  });
+                }),
+            ],
+          ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text(
+              'TLS (connexion chiffrée)',
+              style: TextStyle(fontWeight: FontWeight.w800, color: kSlate),
+            ),
+            value: _tls,
+            onChanged: (v) => setState(() {
+              _tls = v;
+              _raw = null;
+            }),
+          ),
+          if (_tls) _field(_sni, 'SNI (optionnel)'),
+          if (_netType == 'ws') _field(_host, 'Host (optionnel)'),
+          if (_netType == 'ws' || _netType == 'grpc')
+            _field(
+              _path,
+              _netType == 'ws' ? 'Chemin (ex. /ws)' : 'Nom du service gRPC',
+            ),
+        ],
+      ),
     );
   }
 
@@ -499,38 +737,28 @@ class _HomePageState extends State<HomePage> {
                 runSpacing: 4,
                 children: [
                   for (final p in protos)
-                    ChoiceChip(
-                      label: Text(p[1]),
-                      selected: _proto == p[0],
-                      showCheckmark: false,
-                      selectedColor: kSlate,
-                      backgroundColor: Colors.transparent,
-                      shape: const StadiumBorder(),
-                      side: const BorderSide(color: kSlate, width: 2),
-                      labelStyle: TextStyle(
-                        fontWeight: FontWeight.w800,
-                        fontSize: 15,
-                        color: _proto == p[0] ? Colors.white : kSlate,
-                      ),
-                      onSelected: (_) => setState(() {
+                    _chip(p[1], _proto == p[0], () {
+                      setState(() {
                         _proto = p[0];
                         _raw = null;
-                      }),
-                    ),
+                        if (p[0] == 'trojan') _tls = true;
+                      });
+                    }),
                 ],
               ),
               const SizedBox(height: 16),
-              _field(_id, (_proto == 'vmess' || _proto == 'vless') ? 'UUID' : 'Mot de passe'),
+              _field(
+                _id,
+                (_proto == 'vmess' || _proto == 'vless') ? 'UUID' : 'Mot de passe',
+              ),
               if (_proto == 'ss') _field(_method, 'Méthode (ex. aes-256-gcm)'),
               _field(_server, 'Serveur'),
               _field(_port, 'Port', type: TextInputType.number),
+              if (_proto != 'ss') _advanced(),
               const SizedBox(height: 4),
-              SizedBox(
-                width: double.infinity,
-                child: _btn(
-                  _connected || _connecting ? 'DÉCONNECTER' : 'CONNECTER',
-                  _toggle,
-                ),
+              _btn(
+                _connected || _connecting ? 'DÉCONNECTER' : 'CONNECTER',
+                _toggle,
               ),
               const SizedBox(height: 12),
               Container(
@@ -541,37 +769,16 @@ class _HomePageState extends State<HomePage> {
                 ),
                 child: Row(
                   children: [
-                    for (final e in [
-                      ['ENREGISTRER', _save],
-                      ['PARTAGER', _share],
-                      ['PROFILS', _openProfiles],
-                    ].asMap().entries) ...[
-                      if (e.key > 0)
-                        Container(width: 2, height: 52, color: kBg),
-                      Expanded(
-                        child: TextButton(
-                          onPressed: e.value[1] as VoidCallback,
-                          style: TextButton.styleFrom(
-                            foregroundColor: Colors.white,
-                            minimumSize: const Size.fromHeight(52),
-                          ),
-                          child: FittedBox(
-                            child: Text(
-                              e.value[0] as String,
-                              style: const TextStyle(
-                                fontSize: 15,
-                                fontWeight: FontWeight.w800,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
+                    _seg('SAUVER', _save),
+                    Container(width: 2, height: 52, color: kBg),
+                    _seg('PARTAGER', _share),
+                    Container(width: 2, height: 52, color: kBg),
+                    _seg('PROFILS', _openProfiles),
                   ],
                 ),
               ),
               const SizedBox(height: 12),
-              _btn('IMPORTER DEPUIS LE PRESSE-PAPIERS', _import, fs: 15),
+              _btn('IMPORTER DEPUIS LE PRESSE-PAPIERS', _import, fs: 16),
               const SizedBox(height: 40),
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
