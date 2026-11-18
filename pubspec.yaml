@@ -1,0 +1,16 @@
+name: cso_vpn
+description: CSO VPN - appli VPN simple (VMess, VLESS, Trojan, Shadowsocks).
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_vless: 1.1.5
+  shared_preferences: ^2.2.0
+
+flutter:
+  uses-material-design: true
