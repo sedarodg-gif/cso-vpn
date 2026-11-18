@@ -352,10 +352,7 @@ class _HomePageState extends State<HomePage> {
 
   /// Affiche une erreur claire, avec un bouton DÉTAILS pour voir la cause réelle.
   Future<void> _fail(String friendly, Object e) async {
-    var details = '$e';
-    try {
-      details = '$details\n\n${await _vless.getProviderDebugSnapshot()}';
-    } catch (_) {}
+    final details = '$e';
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
