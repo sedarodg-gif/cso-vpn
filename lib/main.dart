@@ -119,9 +119,12 @@ Map<String, String> _streamParams(Account a) {
   if (a.tls) m['sni'] = sni;
   if (a.net == 'ws') {
     if (a.host.isNotEmpty) m['host'] = a.host;
-    if (a.path.isNotEmpty) m['path'] = a.path;
+    m['path'] = a.path.isEmpty ? '/' : a.path;
   }
-  if (a.net == 'grpc' && a.path.isNotEmpty) m['serviceName'] = a.path;
+  if (a.net == 'grpc') {
+    m['mode'] = 'gun';
+    if (a.path.isNotEmpty) m['serviceName'] = a.path;
+  }
   return m;
 }
 
@@ -151,9 +154,9 @@ String buildLink(Account a) {
           'aid': '0',
           'scy': 'auto',
           'net': a.net,
-          'type': 'none',
+          'type': a.net == 'grpc' ? 'gun' : 'none',
           'host': a.host,
-          'path': a.path,
+          'path': (a.net == 'ws' && a.path.isEmpty) ? '/' : a.path,
           'tls': a.tls ? 'tls' : '',
           'sni': a.tls ? sni : '',
         };
@@ -175,6 +178,39 @@ String _b64decode(String s) {
 }
 
 String _normNet(String? n) => (n == 'ws' || n == 'grpc') ? n! : 'tcp';
+
+const Set<String> _secretKeys = {
+  'id',
+  'password',
+  'pass',
+  'uuid',
+  'publicKey',
+  'shortId',
+  'psk',
+  'privateKey',
+};
+
+dynamic _mask(dynamic v) {
+  if (v is Map) {
+    return v.map(
+      (k, val) => MapEntry(
+        k,
+        (_secretKeys.contains(k) && val is String) ? '***' : _mask(val),
+      ),
+    );
+  }
+  if (v is List) return v.map(_mask).toList();
+  return v;
+}
+
+/// Affiche la configuration envoyée au moteur, sans UUID ni mot de passe.
+String maskConfig(String config) {
+  try {
+    return const JsonEncoder.withIndent(' ').convert(_mask(jsonDecode(config)));
+  } catch (_) {
+    return '(configuration illisible)';
+  }
+}
 
 Account? _parseSs(String link) {
   final body = link.substring(5).split('#').first.split('?').first;
@@ -307,6 +343,7 @@ class _HomePageState extends State<HomePage> {
   bool _tls = false;
   String? _raw;
 
+  String? _lastConfig;
   String _state = 'DISCONNECTED';
   int _dur = 0;
   int _down = 0;
@@ -352,7 +389,10 @@ class _HomePageState extends State<HomePage> {
 
   /// Affiche une erreur claire, avec un bouton DÉTAILS pour voir la cause réelle.
   Future<void> _fail(String friendly, Object e) async {
-    final details = '$e';
+    final cfg = _lastConfig;
+    final details = cfg == null
+        ? '$e'
+        : '$e\n\nConfiguration envoyée au moteur (UUID et mots de passe masqués) :\n${maskConfig(cfg)}';
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
@@ -441,10 +481,12 @@ class _HomePageState extends State<HomePage> {
         providerBundleIdentifier: 'com.cso.cso_vpn',
         groupIdentifier: 'group.com.cso.cso_vpn',
       );
+      final config = parsed.getFullConfiguration();
+      _lastConfig = config;
       if (await _vless.requestPermission()) {
         await _vless.startVless(
           remark: parsed.remark,
-          config: parsed.getFullConfiguration(),
+          config: config,
         );
       } else {
         _msg('Permission VPN refusée.');
@@ -452,9 +494,13 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       final text = '$e';
       if (text.contains('INVALID_CONFIG')) {
+        final noTls = (acc.proto == 'vless' || acc.proto == 'trojan') && !acc.tls;
         await _fail(
-          'Configuration refusée. Vérifie UUID / mot de passe, serveur, port, '
-          'TLS et WebSocket, ou importe le lien complet.',
+          noTls
+              ? "Configuration refusée : le moteur n'accepte pas VLESS/Trojan "
+                  'sans TLS. Utilise un compte TLS (port 443) ou un compte VMess.'
+              : 'Configuration refusée. Appuie sur DÉTAILS, copie le texte '
+                  'et envoie-le moi.',
           e,
         );
       } else {
@@ -471,7 +517,10 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     _fill(acc);
-    _msg('Importé : ${acc.proto.toUpperCase()}');
+    _msg(
+      'Importé : ${acc.proto.toUpperCase()} · ${acc.net.toUpperCase()}'
+      '${acc.tls ? ' · TLS' : ' · sans TLS'}',
+    );
   }
 
   Future<void> _save() async {
